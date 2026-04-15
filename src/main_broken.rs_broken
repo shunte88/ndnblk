@@ -1,0 +1,1055 @@
+/*
+ *  main.rs
+ * 
+ *  ndnblk - download multiple files from a nitoflare catalog
+ *      (c) 2025-26 Stuart Hunter (shunte88)
+ *
+ *      TODO:
+ *
+ *      This program is free software: you can redistribute it and/or modify
+ *      it under the terms of the GNU General Public License as published by
+ *      the Free Software Foundation, either version 3 of the License, or
+ *      (at your option) any later version.
+ *
+ *      This program is distributed in the hope that it will be useful,
+ *      but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *      MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *      GNU General Public License for more details.
+ *
+ *      See <http://www.gnu.org/licenses/> to get a copy of the GNU General
+ *      Public License.
+ *
+ */
+
+#[allow(dead_code)]
+#[allow(unused_imports)]
+use clap::{Parser, ArgAction};
+use anyhow::{bail, Context, Result};
+use log::{info, error, warn, debug, LevelFilter};
+use log4rs::append::console::ConsoleAppender;
+use log4rs::append::file::FileAppender;
+use log4rs::config::{Appender, Config, Root};
+use log4rs::encode::pattern::PatternEncoder;
+use rand_agents::user_agent;
+use std::{
+    collections::{HashMap, HashSet}, 
+    env, 
+    error::Error,
+    fs, 
+    io,
+    fs::{File, OpenOptions}, 
+    io::{BufRead, BufReader, Cursor, Write},
+    path::{Path, PathBuf}, 
+    time::Duration
+};
+use futures::future::join_all;
+use chrono::{DateTime, FixedOffset, Utc, Local};
+use chrono::Timelike;
+use fs_extra::file::CopyOptions;
+use fs_extra::file::move_file as fs_move_file;
+
+use std::io::Seek;
+use std::ops::Range;
+use futures::{stream, StreamExt};
+use reqwest::{Proxy, Client, ClientBuilder, StatusCode};
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, RANGE};
+use rss::{Channel, ChannelBuilder, Item, ItemBuilder};
+use scraper::{Html, Selector};
+use tokio::time::{error::Elapsed, sleep};
+use url::Url;
+use regex::Regex;
+use serde_json::Value;
+use tokio::{process::Command, process::Child, sync::mpsc};
+use tokio::fs::create_dir_all;
+use tokio::net::TcpStream;
+use std::thread;
+use std::process::{Stdio};
+use notify_rust::{Notification, Hint, Urgency};
+use webbrowser;
+
+/// Simple boxed error type
+type BoxResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+const BASE_FOLDER: &str = "/data2/bulk_download";
+const DOWNLOAD_FOLDER: &str = "/home/stuart/Downloads";
+const CHUNK_SIZE: u64 = 1024 * 1024;
+const BASE_URL: &str = "https://rapidmoviez.com/feature/x265";
+const SHOWS_RSS: &str = "https://rapidmoviez.com/feed/s";
+const MOVIE_RSS: &str = "https://rapidmoviez.com/feed/m";
+const NF_LINK: &str = "NITROFLARE";
+const MAX_CONCURRENCY: usize = 8;
+const REQUEST_TIMEOUT_SECS: u64 = 15;
+const MAX_RETRIES: u32 = 3;
+const LOG_APPENDER_STDOUT: &str = "stdout";
+const LOG_APPENDER_FILE: &str = "file";
+const LOG_PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S)(utc)} {h({l})} {m}{n}";
+
+#[derive(Parser, Debug)]
+#[command(name = "ndnblk", version, about = "NF bulk downloader", author = "Stuart Hunter (shunte88)")]
+struct Args {
+    /// Increase verbosity (-v = info, -vv = debug, -vvv = trace)
+    #[arg(short, long, action = ArgAction::Count)]
+    verbose: u8,
+    /// Route all HTTP/HTTPS + aria2c traffic through Tor (SOCKS5h)
+    #[arg(long)]
+    tor: bool,
+    /// Optional override URL, e.g. `nuascn https://my.link.com`
+    #[arg(value_name = "URL")]
+    url: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct ProcessEntry {
+    key: String,
+    folder: String,
+    pub link: String,    // RM page
+    pub nf_view: String, // NF view -> file_id
+    pub file_id: String, // NF file details (supports multiple file_id)
+    pub nf_down: String, // NF downloadable by file_id (singular)
+}
+
+struct Aria2cRerun {
+    store: PathBuf,
+    file: File,
+    commands: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct TorManager {
+    addr: String,
+    active: bool,
+    proxy_str: String,
+}
+
+impl TorManager {
+
+    async fn start(use_tor: bool) -> BoxResult<Self> {
+
+        let port: u16 = 9050;
+        let data_dir: PathBuf = "/data2/nuascn/.cache/tor_/".into();
+        let _config_dir: PathBuf = "/etc/tor/torrc".into();
+        fs::create_dir_all(&data_dir)?;
+        let addr = format!("localhost:{port}");
+        let mut active = false;
+        let proxy_str = if use_tor {
+            active = true;
+            format!("socks5h://{}", addr.clone())
+        } else {
+            String::new()
+        };
+        Ok(Self {
+            addr,
+            active,
+            proxy_str,
+        })
+
+    }
+
+    fn add_tor_proxy(self, builder: ClientBuilder) -> ClientBuilder {
+        if !self.proxy_str.is_empty() {
+            builder.proxy(Proxy::all(self.proxy_str.clone()).unwrap())
+        } else {
+            builder
+        }
+    }
+
+    pub async fn is_tor_running(&self) -> Result<()> {
+        // Make sure you are running tor and this is your socks port
+        let proxy = reqwest::Proxy::all(self.proxy_str.clone())
+            .context("Failed to construct Tor proxy URL")?;
+        let client = reqwest::Client::builder().proxy(proxy).build()?;
+
+        let res = client.get("https://check.torproject.org").send().await?;
+        let text = res.text().await?;
+
+        if !text.contains("Congratulations. This browser is configured to use Tor.") {
+            bail!("Tor is currently not running")
+        }
+        Ok(())
+    }
+
+    fn proxy_str(&self) -> String {
+        self.proxy_str.clone()
+    }
+
+}
+
+#[derive(Clone, Debug)]
+struct Aria2cResult {
+    good: bool,
+    success: bool,
+    key: String,
+}
+
+impl Aria2cResult {
+
+    fn init(key: String) -> BoxResult<Self> {
+        let good = false;
+        let success = false;
+        Ok(Self {
+            good,
+            success,
+            key
+        })
+    }
+}
+
+#[allow(dead_code)]
+struct KvStore {
+    store: PathBuf,
+    map: HashMap<String, String>,
+    file: File, // append-only handle
+}
+
+impl KvStore {
+    /// Open or create the KV store.
+    /// Format: one entry per line => "key|value\n"
+    fn open(store: impl Into<PathBuf>) -> BoxResult<Self> {
+        let store = store.into();
+
+        // Ensure file exists
+        let file_for_read = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&store)?;
+
+        let mut map = HashMap::new();
+        let reader = BufReader::new(file_for_read);
+
+        // Load existing entries
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            // Very simple format: key|value
+            if let Some((k, v)) = line.split_once('|') {
+                map.insert(k.to_string(), v.to_string());
+            }
+        }
+
+        // Re-open in append mode for writing
+        let file_for_append = OpenOptions::new()
+            .append(true)
+            .write(true)
+            .create(true)
+            .open(&store)?;
+
+        Ok(KvStore {
+            store,
+            map,
+            file: file_for_append,
+        })
+    }
+
+    fn get(&self, key: &str) -> Option<&str> {
+        self.map.get(key).map(|s| s.as_str())
+    }
+
+    fn insert(&mut self, key: &str, value: &str) -> BoxResult<()> {
+        // Only write if it's new
+        if self.map.contains_key(key) {
+            return Ok(());
+        }
+        writeln!(self.file, "{}|{}", key, value)?;
+        self.file.flush()?;
+        self.map.insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Source {
+    HtmlMulti,
+}
+
+impl Source {
+    fn tag(&self) -> &'static str {
+        match self {
+            Source::HtmlMulti => "HTML-MULTI",
+        }
+    }
+}
+
+struct FeedItem {
+    name: String,
+    link: String,
+    source: Source,
+}
+
+#[derive(Clone, Debug)]
+struct NFDown {
+    client: Client,
+    ux: String,
+    px: String,
+    pub ntf_download_link: String,
+    pub ntf_captcha_link: String,
+    max_retries: u32,
+}
+
+impl NFDown {
+
+    fn init(
+        ux: &str, 
+        px: &str,
+        tunnel: TorManager
+    ) -> BoxResult<Self> {
+
+        const NTFURL_API: &str = "https://nitroflare.com/api/v2";
+        let ntf_download_link: String = format!("{NTFURL_API}/getDownloadLink");
+        // throttling - error code 12
+        let ntf_captcha_link: String = format!("{NTFURL_API}/solveCaptcha?user={ux}");
+        let agent = user_agent();
+        let builder = Client::builder()
+            .user_agent(agent)
+            .timeout(Duration::from_secs(20));
+
+        let builder = tunnel.add_tor_proxy(builder);
+        let client = builder
+            .build()?;
+
+        Ok(Self {
+            client,
+            ux: ux.to_string().clone(),
+            px: px.to_string().clone(),
+            ntf_download_link: ntf_download_link.clone(),
+            ntf_captcha_link: ntf_captcha_link.clone(),
+            max_retries: 3
+        })
+    }
+
+    fn premium_params(&self) -> Vec<(&str, &str)> {
+        vec![("user", self.ux.as_str()), ("premiumKey", self.px.as_str())]
+    }
+
+    async fn get_json_with_retries(
+        &self,
+        url: &str,
+        params: &[(&str, &str)],
+    ) -> BoxResult<Value> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let res = self
+                .client
+                .get(url)
+                .query(params)
+                .send()
+                .await;
+
+            match res {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if !status.is_success() {
+                        if attempt >= self.max_retries {
+                            return Err(format!(
+                                "Non-success status {} for {} after {} attempts",
+                                status, url, attempt
+                            )
+                            .into());
+                        }
+                    } else {
+                        match resp.json::<Value>().await {
+                            Ok(j) => return Ok(j),
+                            Err(e) => {
+                                if attempt >= self.max_retries {
+                                    return Err(format!(
+                                        "JSON decode error for {} after {} attempts: {}",
+                                        url, attempt, e
+                                    )
+                                    .into());
+                                } else {
+                                    warn!(
+                                        "JSON error for {} attempt {} – retrying: {}",
+                                        url, attempt, e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if attempt >= self.max_retries {
+                        return Err(format!(
+                            "Request error for {} after {} attempts: {}",
+                            url, attempt, e
+                        )
+                        .into());
+                    } else {
+                        warn!(
+                            "Request error for {} attempt {} – retrying: {}",
+                            url, attempt, e
+                        );
+                    }
+                }
+            }
+
+            let delay_ms = 500 * attempt as u64;
+            sleep(Duration::from_millis(delay_ms)).await;
+        }
+
+    }
+
+    ///
+    /// `files` is Vec of (Vec<uri>, tag)
+    /// Returns Vec of (download_url, destination_path, tag)
+    pub async fn get_download(
+        &self,
+        pm: &ProcessEntry,
+    ) -> BoxResult<String> {
+
+        let file_id = pm.file_id.as_str();
+        let mut download = String::new();
+
+        // getDownloadLink
+        let mut params_dl = self.premium_params();
+        params_dl.push(("file", file_id));
+
+        let j_dl = self
+            .get_json_with_retries(&self.ntf_download_link.clone().as_str(), &params_dl)
+            .await?;
+
+        let result = match j_dl.get("result") {
+            Some(r) => r,
+            None => {
+                let err= match j_dl.get("code").and_then(|v| v.as_i64()) {
+                    Some(e) => e,
+                    None => 0,
+                };
+
+                if err==-12 { // negate for now
+                    pop_message(self.ntf_captcha_link.clone().as_str(), err);
+                    // call again
+                    
+                } else if err==12 {                    
+                    warn!("{}",self.ntf_captcha_link.clone().as_str());
+                    warn!("{}",self.ntf_captcha_link.clone().as_str());
+                    warn!("{}",self.ntf_captcha_link.clone().as_str());
+                } else {
+                    warn!(
+                        "{}\nJSON broken for file_id={}: (payload={:?}",
+                        self.ntf_download_link.clone(), file_id, j_dl
+                    );
+                }
+                return Ok(download);
+            }
+        };
+
+        download = match result.get("url").and_then(|v| v.as_str()) {
+            Some(u) if !u.is_empty() => u.to_string(),
+            _ => {
+                warn!(
+                    "JSON missing download url for file_id={}: (payload={:?})",
+                    file_id, j_dl
+                );
+                return Ok(download);
+            }
+        };
+
+        Ok(download)
+
+    }
+
+}
+
+#[tokio::main]
+async fn main() -> BoxResult<()> {
+
+    let args = Args::parse();
+
+    let h = Local::now();  // current time - used here to name the log, and later to drive runtime logic
+
+    let stdout = ConsoleAppender::builder()
+        .encoder(Box::new(PatternEncoder::new(LOG_PATTERN)))
+        .build();
+    let log_file_name = format!("./logs/nuascn.{}.log", h.timestamp());
+    let log_file = FileAppender::builder()
+        .encoder(Box::new(PatternEncoder::new(LOG_PATTERN)))
+        .build(log_file_name)
+        .unwrap();
+
+    // set log level based on verbose
+    let loglev = match args.verbose {
+        0 => LevelFilter::Info,
+        1 => LevelFilter::Debug,
+        _ => LevelFilter::Trace,
+    };
+    let config = Config::builder()
+        .appender(Appender::builder().build(LOG_APPENDER_STDOUT, Box::new(stdout)))
+        .appender(Appender::builder().build(LOG_APPENDER_FILE, Box::new(log_file)))
+        .build(
+            Root::builder()
+                .appender(LOG_APPENDER_STDOUT)
+                .appender(LOG_APPENDER_FILE)
+                .build(loglev),
+        )
+        .unwrap();
+    log4rs::init_config(config).unwrap();
+
+    let ux = getenv("NTFLR_USERNAME", "");
+    if ux.is_empty() {
+        error!("NTFLR_USERNAME not set");
+        return Ok(());
+    }
+
+    // note we are assuming the tor service has control here
+    // but can deactivate proxy usage via command line
+    let tunnel = TorManager::start(args.tor).await?;
+
+    if tunnel.active{
+        info!{"Tor is in use"}
+    }
+
+    // initiate downloader
+    let sdx = NFDown::init(
+        ux.clone().as_str(),
+        getenv("NTFLR_PREMIUM", "").as_str(),
+        tunnel.clone(),
+    ).unwrap();
+
+    let mut urls: Vec<String> = Vec::new();
+
+    if let Some(url) = args.url.clone() {
+        // positional override
+        urls.push(url);
+    }
+
+    if urls.is_empty() {
+        error!("No URLs generated/specified. Quitting...");
+        return Ok(());
+    }
+
+    let agent = user_agent();
+    let builder = Client::builder()
+        .user_agent(agent)
+        //.danger_accept_invalid_certs(true)       // skips cert validation (use only for scraping)
+        //.danger_accept_invalid_hostnames(true)   // hostname mismatch accepted too
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS));
+
+    let builder = tunnel.add_tor_proxy(builder);
+    let client = builder
+        .build()?;
+
+    let now_utc = Utc::now();
+    let now_fixed: DateTime<FixedOffset> = now_utc.into();
+    let pub_date_str = now_fixed.to_rfc2822();
+
+    // we'll need the real selector - review the page source
+    let selector = Selector::parse("a").expect("Selector parse for <a> should never fail");
+
+    let urls_clone = urls.clone();
+    // Fetch and process all HTML pages in parallel with bounded concurrency
+    let stream = stream::iter(urls_clone.into_iter().map(|url| {
+
+        let client = client.clone();
+        let selector = selector.clone();
+        let key: &str = "";
+
+        async move {
+            match process_page_with_retries(
+                &client, 
+                &selector, 
+                &url, 
+                MAX_RETRIES, 
+                false, 
+                key, 
+            ).await {
+                Ok(links) => {
+                    if !links.is_empty() {
+                        info!("Found {:>2} links for {}", links.len(), url);
+                    }
+                    links
+                }
+                Err(_e) => {
+                    Vec::new()
+                }
+            }
+        }
+    }))
+    .buffer_unordered(MAX_CONCURRENCY);
+
+    // Collect items from HTML pages
+    tokio::pin!(stream);
+    while let Some(links) = stream.next().await {
+        for (title, href) in links {
+            feed_items.push(FeedItem {
+                title,
+                link: href,
+                source: Source::Folder,
+            });
+        }
+    }
+
+    if !feed_items.is_empty() {
+        info!("Total items: {}", feed_items.len());
+    }
+
+    // process list: key -> ProcessEntry
+    let mut process_map: HashMap<String, ProcessEntry> = HashMap::new();
+
+    // load re-run list
+    let mut arr = Aria2cRerun::init("aria_rerun.list".to_string()).unwrap();
+    arr.load_list()?;
+
+    let mut work_done = false;
+    for cmd in arr.commands {
+
+        // decompose the commmand to put it back on the queue
+        let chunks: Vec<&str> = cmd.split(' ').collect();
+        work_done = true;
+  
+        process_map.insert(
+            key.clone(),
+            ProcessEntry {
+                key: key.clone().to_string(),
+                rerun,
+                title: show_name,
+                show_name: show_name_norm.to_string(),
+                folder: folder_name.to_string(),
+                sanitized_name: sanitized_name.to_string(),
+                extention: ext.to_string(),
+                link: link.to_string(),
+                file_id: String::new(),
+                nf_view: String::new(),
+                nf_down: link.to_string(),
+            },
+        );
+
+    }
+
+    info!("Interested in {} shows.",interest.len());
+    info!("Evaluating links...");
+
+    for item in channel.items() {
+        let raw_title = match item.title() {
+            Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+            _ => continue,
+        };
+
+        let link = item.link().unwrap_or("").trim().to_string();
+        if link.is_empty() {
+            continue;
+        }
+
+        let core = extract_title_core(&raw_title);
+        let key = sanitize_show(&core, &re_se);
+        let show_name_norm = extract_show_from_key(&key, &re_se);
+        let folder_name = format!(
+            "{}/{}", 
+            DOWNLOAD_FOLDER, 
+            initcap_string(show_name_norm.clone().as_str())
+        );
+        let sanitized_name = initcap_string(core.clone().replace(' ',".").as_str());
+        
+        if !interest.contains(&show_name_norm) {
+            continue;
+        }
+
+        // Check seen KV
+        if let Some(_ts) = kv.get(&key) {
+            continue;
+        }
+
+        // are we already on the stack?
+        if let Some(existing) = process_map.get(&key) {
+            // Promotion: if we already accepted (say) a 720p and we later see a 1080p
+            // for the same show+episode key, prefer the higher-quality entry.
+            // (Extensible ladder: 720 < 1080 < 2160)
+            if !existing.rerun {
+                let old_rank = detect_quality_rank(&existing.title);
+                let new_rank = detect_quality_rank(&raw_title);
+
+                if new_rank > old_rank {
+                    info!("{key} -> promoting from {}p to {}p", old_rank, new_rank);
+
+                    // Overwrite the process entry with better source details.
+                    // Key stays identical; we keep rerun=false.
+                    process_map.insert(
+                        key.clone(),
+                        ProcessEntry {
+                            key: key.clone(),
+                            rerun: false,
+                            title: raw_title.clone(),
+                            show_name: show_name_norm.clone(),
+                            folder: folder_name.clone(),
+                            sanitized_name: sanitized_name.clone(),
+                            extention: String::new(),
+                            link: link.clone(),
+                            file_id: String::new(),
+                            nf_view: String::new(),
+                            nf_down: String::new(),
+                        },
+                    );
+                }
+            }
+            continue;
+        }
+
+        info!("{key} -> moved to process...");
+        let rerun = false;
+        // we can process further
+        process_map.insert(
+            key.clone(),
+            ProcessEntry {
+                key,
+                rerun,
+                title: raw_title,
+                show_name: show_name_norm,
+                folder: folder_name,
+                sanitized_name: sanitized_name,  // will need file type!
+                extention: String::new(),
+                link,
+                file_id: String::new(),
+                nf_view: String::new(),
+                nf_down: String::new(),
+            },
+        );
+    }
+
+    match fs::remove_file(OUTPUT_FILE) {
+            Ok(_) => {},
+            Err(_e) => {},
+    }
+
+    if process_map.is_empty() {
+        warn!("Nothing to process, we're done...");
+        return Ok(());
+    }
+
+    let mut patch_map: HashMap<String, ProcessEntry> = HashMap::new();
+
+    if single {
+
+        for key in process_map.keys().cloned().into_iter() {
+            // Obtain a snapshot of the entry to check without holding an immutable borrow
+            if let Some(pm) = process_map.get(&key) {
+                if pm.title.contains(Source::HtmlMulti.tag()) {
+                    let link = pm.link.as_str();
+                    let (ext, file_id) = get_attr_file_id(link).unwrap();
+                    let mut nf_down = String::new();
+                    let mut ppp = pm.clone();
+                    ppp.file_id = file_id.to_string();
+                    if !file_id.is_empty() {
+                        nf_down = sdx.get_download(&ppp).await.unwrap();
+                        if !nf_down.is_empty() {
+                            work_done = true;
+                        }
+                    }
+                    patch_map.insert(
+                        key.clone(),
+                        ProcessEntry {
+                            key: key.clone().to_string(),
+                            rerun: false,
+                            title: pm.title.clone(),
+                            show_name: pm.show_name.clone(),
+                            folder: pm.folder.clone(),
+                            sanitized_name: pm.sanitized_name.clone(),
+                            extention: format!(".{}", ext.to_string()),
+                            link: pm.link.clone(),
+                            file_id: file_id.to_string(),
+                            nf_view: link.to_string(),
+                            nf_down,
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    if single && !patch_map.is_empty() {
+        process_map = patch_map;
+    }
+
+    let selector = Selector::parse("pre.links").expect("valid <pre class=\"links\"> selector");
+    // Fetch and process all HTML pages in parallel with bounded concurrency
+    let streamnf = stream::iter(process_map.keys().into_iter().map(|entry| {
+
+        // get the link for the entry
+        let p = process_map.get(entry).unwrap();
+        let url = p.link.clone();
+        let rerun = p.rerun;
+        let client = client.clone();
+        let selector = selector.clone();
+
+        async move {
+            match process_page_with_retries(
+                &client, 
+                &selector, 
+                &url, 
+                MAX_RETRIES, 
+                true, 
+                entry.clone().as_str(),
+                rerun,
+                ignore_tests,
+            ).await 
+            {
+                Ok(links) => {
+                    links
+                }
+                Err(_e) => {
+                    Vec::new()
+                }
+            }
+        }
+    }))
+    .buffer_unordered(MAX_CONCURRENCY);
+
+    // assemble the NF links we digested
+    let mut pm = process_map.clone();
+    tokio::pin!(streamnf);
+    while let Some(links) = streamnf.next().await {
+        for (key, href) in links {
+            if pm.contains_key(key.as_str()) {
+                let p = pm.get_mut(key.as_str()).unwrap();
+                if p.rerun {
+                    work_done = true;
+                    continue;
+                }
+                let link = &href.clone();
+                let (ext, file_id) = get_attr_file_id(link).unwrap();
+                p.nf_view = href.clone();
+                p.extention = format!(".{}", ext.to_string());
+                p.file_id = file_id.to_string();
+                if !p.file_id.is_empty() {
+                    p.nf_down = sdx.get_download(p).await.unwrap();
+                    if !p.nf_down.is_empty() {
+                        work_done = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if work_done {
+
+        // pre-flight: ensure aria2c exists
+        // this is just noise so parking the call
+        //ensure_aria2c("aria2c").await?;
+
+        let streamnf = stream::iter(process_map.keys().into_iter().map(|entry| {
+
+            let p = pm.get(entry.as_str()).unwrap();
+            let mut arr = Aria2cRerun::init("aria_rerun.list".to_string()).unwrap();
+
+            async move {
+                match aria2c_download(p, &mut arr).await {
+                    Ok(good) => {
+                        good
+                    }
+                    Err(_e) => {
+                        Aria2cResult::init("".to_string()).unwrap()
+                    }
+                }
+            }
+        }))
+        .buffer_unordered(MAX_CONCURRENCY);
+   
+        let now: DateTime<Utc> = Utc::now();
+        let ts = now.format("%Y-%m-%dT%H:%M:%S%z").to_string();
+        tokio::pin!(streamnf);
+        while let Some(ret) = streamnf.next().await {
+            if !ret.key.is_empty() {
+                let p = pm.get(ret.key.clone().as_str()).unwrap();
+                if !p.rerun {
+                    let _ = kv.insert(ret.key.clone().as_str(), ts.clone().as_str());
+                    info!("{} closing out...", ret.key.clone());
+                }
+                if ret.success {
+                    let _ = move_file(p).await?;
+                }
+            }
+        }
+
+    } else {
+        warn!("work was not performed, maybe try again");
+    }
+
+    Ok(())
+
+}
+
+fn pop_message(url: &str, err: i64) {
+
+    if webbrowser::open(url).is_ok() {
+        Notification::new()
+            .summary(format!("Error {err} showCaptcha!").as_str())
+            .body("NF is getting miffed, run showCaptcha!")
+            .icon("dialog-warning")
+            .hint(Hint::Resident(true)) // Keeps notification visible until closed/actioned
+            .urgency(Urgency::Critical) // High importance notification
+            .action("default", "Show Captcha") // Default action
+            .show()
+            .unwrap()
+            .wait_for_action(|action| {
+                match action {
+                    "default" => println!("show captcha."),
+                    "__closed" => println!("Notification closed by user."), // Special keyword for closing
+                    _ => {}
+                }
+            });
+
+            }
+}
+
+async fn move_file(pe: &ProcessEntry) -> io::Result<()> {
+
+    let source_file = PathBuf::from(format!("{}/{}{}",pe.folder.clone(),pe.sanitized_name,pe.extention));
+    let destination_dir = PathBuf::from(BASE_FOLDER);
+    let destination_file = PathBuf::from(format!("{}/{}{}", BASE_FOLDER,pe.sanitized_name,pe.extention));
+    fs::create_dir_all(&destination_dir)?;
+    info!("{} -> {}", source_file.display(), destination_file.display());
+    match fs_move_file(&source_file, &destination_file, &CopyOptions::new()) {
+        Ok(_) => info!("move complete."),
+        Err(e) => eprint!("move exception: {e}"),
+    }
+    Ok(())
+}
+
+async fn aria2c_download(pe: &ProcessEntry, arr: &mut Aria2cRerun) -> BoxResult<Aria2cResult> {
+
+    let mut ret = Aria2cResult::init(pe.key.clone()).unwrap();
+    // Try to detect filename before handing to aria2c
+    let aria2c_path = "aria2c";
+    let filename = format!("{}{}", pe.sanitized_name, pe.extention);
+
+    fs::create_dir_all(pe.folder.clone())?;
+
+    // Build command: aria2c --dir <dir> --out <filename> [args...] <url>
+    let mut args: Vec<String> = vec![
+        "--dir".into(),
+        pe.folder.clone().into(),
+        "--out".into(),
+        filename.clone(),
+        "--quiet".into(),
+        "--max-connection-per-server=16".into(),
+        "--max-concurrent-downloads=16".into(),
+        "--split=20".into(),
+        "--continue=true".into(),
+        "--auto-file-renaming=true".into(),
+        "--summary-interval=0".into(),
+        "--allow-overwrite=true".into(),
+    ];
+    args.push(pe.nf_down.clone().into());
+
+    // these we just need to fire and forget
+    let command = format!("{} {}", aria2c_path, args.join(" "));
+    debug!("[aria2c] {}", command.clone());
+    let status = Command::new(aria2c_path).args(&args).status().await?;
+    debug!("[aria2c] {} {}", status, status.success());
+
+    ret.success = status.success();
+
+    if !status.success() {
+        error!("aria2c failed -> {status}");
+        ret.good = true; // added to rerun (so rerun is consumed and not picked up from the scrape), and we close out
+    }else{
+        ret.good = true; // close out
+    }
+
+    Ok(ret)
+
+}
+
+fn get_attr_file_id(href: &str) -> Result<(&str, &str)> {
+    let temp: Vec<&str> = href.clone().split('.').collect();
+    let ext = temp[temp.len()-1];
+    let temp: Vec<&str> = href.clone().split('/').collect();
+    let file_id = temp[4];
+    Ok((ext, file_id))
+}
+
+async fn get_chunked(pe: &ProcessEntry) -> BoxResult<Aria2cResult> {
+
+    let key = pe.key.clone();
+    info!("{}", key.clone());
+    let mut ret = Aria2cResult::init(key.clone()).unwrap();
+    let url = pe.nf_down.clone();
+    let output_path = format!("{}/Ck_{}{}", pe.folder, pe.name, pe.extention);
+
+    fs::create_dir_all(pe.folder.clone())?;
+    let client = Client::new();
+
+    // Get file size and check for range support
+    // implement retries for this
+    let response = client.head(url.clone()).send().await?;
+    let content_length = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|l| l.to_str().ok())
+        .and_then(|l| l.parse::<u64>().ok())
+        .ok_or("Failed to get {CONTENT_LENGTH}")?;
+
+    let mut file = File::create(output_path.clone())?;
+    if !response.headers().contains_key("accept-ranges") {
+        warn!("Warning: Server does not support range requests. Downloading sequentially.");
+        // Fallback to sequential download if range requests are not supported
+        let mut response = client.get(url.clone()).send().await?.error_for_status()?;
+        while let Some(chunk) = response.chunk().await? {
+            file.write_all(&chunk)?;
+        }
+        return Ok(ret);
+    }
+
+    // 2. Range supported, pre-allocate space
+    file.set_len(content_length)?;
+
+    // Determine chunk ranges
+    let mut chunk_ranges: Vec<Range<u64>> = Vec::new();
+    let mut start = 0;
+    while start < content_length {
+        let end = (start + CHUNK_SIZE - 1).min(content_length - 1);
+        chunk_ranges.push(start..end + 1);
+        start += CHUNK_SIZE;
+    }
+
+    info!("<<< {output_path} {content_length}bytes {}chunks", chunk_ranges.len());
+    //let mut done = 0;
+    // Download chunks in parallel
+    let mut tasks = Vec::new();
+    for (i, range) in chunk_ranges.into_iter().enumerate() {
+        let client = client.clone(); // Clone client for each task
+        let output_path = output_path.to_string();
+        let url = url.clone();
+        let task = tokio::spawn(
+            async move {
+
+                let mut file = File::options().write(true).open(&output_path)?;
+                let range_header = format!("bytes={}-{}", range.start, range.end - 1);
+                // implement retries for this
+                let response = client.get(url.clone())
+                    .header(RANGE, range_header)
+                    .send()
+                    .await?
+                    .error_for_status()?;
+
+                file.seek(std::io::SeekFrom::Start(range.start))?;
+                let bytes = response.bytes().await?;
+                file.write_all(&bytes)?;
+                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+
+            }
+        );
+
+        tasks.push(task);
+
+    }
+
+    // Wait for all tasks to complete
+    join_all(tasks).await;
+
+    info!(">>> {output_path}");
+
+    ret.good = true;
+    Ok(ret)
+
+}
+
+fn getenv(key: &str, defo: &str) -> String {
+    match env::var(key) {
+        Ok(val) => val,
+        Err(_e) => defo.to_string().clone()
+    }
+}

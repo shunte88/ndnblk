@@ -147,10 +147,11 @@ impl NFDown {
                         return Ok(dl_url.to_string());
                     }
                     let code = j.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
-                    if code == 12 {
-                        warn!("Rate-limited (error 12) for {file_id}");
-                    } else {
-                        warn!("Unexpected API response for {file_id}: {j:?}");
+                    let msg  = j.get("message").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    match code {
+                        9  => warn!("Daily bandwidth limit reached ({file_id}) — {msg}"),
+                        12 => warn!("Rate-limited for {file_id}"),
+                        _  => warn!("API error {code} for {file_id}: {msg}"),
                     }
                     return Ok(String::new());
                 }
@@ -258,7 +259,7 @@ async fn collect_folder_links(client: &Client, folder_url: &str) -> BoxResult<Ve
 
 // aria2c
 
-async fn aria2c_download(item: &DownloadItem) -> BoxResult<bool> {
+async fn aria2c_download(item: &DownloadItem, nfd: &NFDown) -> BoxResult<bool> {
     fs::create_dir_all(&item.dir)?;
     let dest = std::path::Path::new(&item.dir).join(&item.filename);
     let a = vec![
@@ -278,6 +279,16 @@ async fn aria2c_download(item: &DownloadItem) -> BoxResult<bool> {
     if fs::metadata(&dest).map(|m| m.len() > 1024).unwrap_or(false) {
         info!("Skipping (exists): {}", item.filename);
         return Ok(true);
+    }
+
+    // Live bandwidth check — skip if less than 10% of daily allowance remains
+    match nfd.get_key_info().await {
+        Ok((left, max)) if max > 0 && left < max / 10 => {
+            warn!("Skipping (bandwidth < 10%): {} — {} remaining", item.filename, fmt_bytes(left));
+            return Ok(false);
+        }
+        Err(e) => warn!("Could not check bandwidth before {}: {e}", item.filename),
+        _ => {}
     }
 
     debug!("aria2c {}", a.join(" "));
@@ -391,7 +402,25 @@ async fn main() -> BoxResult<()> {
         })
         .collect();
 
-    // Step 3: resolve download URLs via NF API (sequential, gentle)
+    // Step 3: bandwidth check — pre-filter before resolving URLs
+    let (mut traffic_left, traffic_max) = nfd.get_key_info().await?;
+    info!("Bandwidth: {} / {} remaining today", fmt_bytes(traffic_left), fmt_bytes(traffic_max));
+    items.retain(|item| {
+        if item.size_bytes > 0 && item.size_bytes > traffic_left {
+            warn!("Skipping (insufficient bandwidth): {} — needs {}, only {} left",
+                item.filename, fmt_bytes(item.size_bytes), fmt_bytes(traffic_left));
+            false
+        } else {
+            traffic_left = traffic_left.saturating_sub(item.size_bytes);
+            true
+        }
+    });
+    if items.is_empty() {
+        warn!("No files within today's bandwidth limit");
+        return Ok(());
+    }
+
+    // Step 4: resolve download URLs via NF API (sequential, gentle)
     info!("Resolving download URLs...");
     for item in &mut items {
         match nfd.get_download_url(&item.file_id).await {
@@ -399,39 +428,27 @@ async fn main() -> BoxResult<()> {
                 debug!("{} -> ok", item.filename);
                 item.nf_down = url;
             }
-            Ok(_) => warn!("No URL returned for {} ({})", item.filename, item.file_id),
+            Ok(_) => {} // reason already logged in get_download_url
             Err(e) => warn!("API error for {}: {e}", item.file_id),
         }
         sleep(Duration::from_millis(300)).await;
     }
 
-    let resolved: Vec<&DownloadItem> = items.iter().filter(|i| !i.nf_down.is_empty()).collect();
-    info!("{}/{} file(s) ready", resolved.len(), items.len());
-    if resolved.is_empty() {
+    let ready: Vec<&DownloadItem> = items.iter().filter(|i| !i.nf_down.is_empty()).collect();
+    info!("{}/{} file(s) ready", ready.len(), items.len());
+    if ready.is_empty() {
         warn!("Nothing to download");
         return Ok(());
     }
-
-    // Step 4: bandwidth check then aria2c downloads (bounded concurrency)
-    let (mut traffic_left, traffic_max) = nfd.get_key_info().await?;
-    info!("Bandwidth: {} / {} remaining today", fmt_bytes(traffic_left), fmt_bytes(traffic_max));
-
-    let mut ready: Vec<&DownloadItem> = Vec::new();
-    for item in resolved {
-        if item.size_bytes > 0 && item.size_bytes > traffic_left {
-            warn!("Skipping (insufficient bandwidth): {} — needs {}, only {} left",
-                item.filename, fmt_bytes(item.size_bytes), fmt_bytes(traffic_left));
-        } else {
-            traffic_left = traffic_left.saturating_sub(item.size_bytes);
-            ready.push(item);
-        }
-    }
-    let results = stream::iter(ready.iter().map(|item| async move {
-        info!("Starting: {}", item.filename);
-        match aria2c_download(item).await {
-            Ok(true)  => { info!("Done: {}",   item.filename); true  }
-            Ok(false) => { error!("Failed: {}", item.filename); false }
-            Err(e)    => { error!("Error {}: {e}", item.filename); false }
+    let results = stream::iter(ready.iter().map(|item| {
+        let nfd = nfd.clone();
+        async move {
+            info!("Starting: {}", item.filename);
+            match aria2c_download(item, &nfd).await {
+                Ok(true)  => { info!("Done: {}",   item.filename); true  }
+                Ok(false) => { error!("Failed: {}", item.filename); false }
+                Err(e)    => { error!("Error {}: {e}", item.filename); false }
+            }
         }
     }))
     .buffer_unordered(MAX_CONCURRENCY)

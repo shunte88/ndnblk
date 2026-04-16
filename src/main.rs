@@ -66,6 +66,7 @@ struct DownloadItem {
     filename: String,
     nf_down: String, // resolved download URL
     dir: String,
+    size_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -112,6 +113,18 @@ impl NFDown {
         Ok(Self { client, ux: ux.to_string(), px: px.to_string() })
     }
 
+    async fn get_key_info(&self) -> BoxResult<(u64, u64)> {
+        let url = format!("{NTFURL_API}/getKeyInfo");
+        let params = [("user", self.ux.as_str()), ("premiumKey", self.px.as_str())];
+        let j: Value = self.client.get(&url).query(&params).send().await?.json().await?;
+        let result = j.get("result");
+        let left = result.and_then(|r| r.get("trafficLeft"))
+            .and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0u64);
+        let max  = result.and_then(|r| r.get("trafficMax"))
+            .and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0u64);
+        Ok((left, max))
+    }
+
     async fn get_download_url(&self, file_id: &str) -> BoxResult<String> {
         let url = format!("{NTFURL_API}/getDownloadLink");
         let params = [
@@ -150,6 +163,30 @@ impl NFDown {
     }
 }
 
+// helpers
+
+fn parse_size_bytes(s: &str) -> u64 {
+    let s = s.trim();
+    let (num, unit) = s.split_once(' ').unwrap_or((s, "B"));
+    let n: f64 = num.parse().unwrap_or(0.0);
+    let mult = match unit.to_ascii_uppercase().as_str() {
+        "KB" => 1_024.0,
+        "MB" => 1_048_576.0,
+        "GB" => 1_073_741_824.0,
+        "TB" => 1_099_511_627_776.0,
+        _    => 1.0,
+    };
+    (n * mult) as u64
+}
+
+fn fmt_bytes(b: u64) -> String {
+    const GB: u64 = 1_073_741_824;
+    const MB: u64 = 1_048_576;
+    if b >= GB { format!("{:.2} GB", b as f64 / GB as f64) }
+    else if b >= MB { format!("{:.2} MB", b as f64 / MB as f64) }
+    else { format!("{} B", b) }
+}
+
 // Folder scraping
 
 /// Parse userId and folder from https://nitroflare.com/folder/{userId}/{folder}
@@ -162,13 +199,13 @@ fn parse_folder_url(folder_url: &str) -> Option<(String, String)> {
     }
 }
 
-/// POST to ajax/folder.php and return all (file_id, filename) pairs across all pages.
-async fn collect_folder_links(client: &Client, folder_url: &str) -> BoxResult<Vec<(String, String)>> {
+/// POST to ajax/folder.php and return all (file_id, filename, size_bytes) triples across all pages.
+async fn collect_folder_links(client: &Client, folder_url: &str) -> BoxResult<Vec<(String, String, u64)>> {
     let (user_id, folder) = parse_folder_url(folder_url)
         .ok_or_else(|| format!("Cannot parse folder URL: {folder_url}"))?;
 
     const PER_PAGE: usize = 100;
-    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut pairs: Vec<(String, String, u64)> = Vec::new();
     let mut page: usize = 1;
 
     loop {
@@ -200,10 +237,11 @@ async fn collect_folder_links(client: &Client, folder_url: &str) -> BoxResult<Ve
             for file in files {
                 let url  = file.get("url") .and_then(|v| v.as_str()).unwrap_or("");
                 let name = file.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let size = file.get("size").and_then(|v| v.as_str()).unwrap_or("");
                 // url is "view/FILE_ID/encoded_name" — extract the id segment
                 if let Some(file_id) = url.split('/').nth(1) {
                     if !file_id.is_empty() && !name.is_empty() {
-                        pairs.push((file_id.to_string(), name.to_string()));
+                        pairs.push((file_id.to_string(), name.to_string(), parse_size_bytes(size)));
                     }
                 }
             }
@@ -344,11 +382,12 @@ async fn main() -> BoxResult<()> {
     // Step 2: build download items
     let mut items: Vec<DownloadItem> = pairs
         .into_iter()
-        .map(|(file_id, filename)| DownloadItem {
+        .map(|(file_id, filename, size_bytes)| DownloadItem {
             file_id,
             filename,
             nf_down: String::new(),
             dir: args.dir.clone(),
+            size_bytes,
         })
         .collect();
 
@@ -366,14 +405,27 @@ async fn main() -> BoxResult<()> {
         sleep(Duration::from_millis(300)).await;
     }
 
-    let ready: Vec<&DownloadItem> = items.iter().filter(|i| !i.nf_down.is_empty()).collect();
-    info!("{}/{} file(s) ready", ready.len(), items.len());
-    if ready.is_empty() {
+    let resolved: Vec<&DownloadItem> = items.iter().filter(|i| !i.nf_down.is_empty()).collect();
+    info!("{}/{} file(s) ready", resolved.len(), items.len());
+    if resolved.is_empty() {
         warn!("Nothing to download");
         return Ok(());
     }
 
-    // Step 4: aria2c downloads (bounded concurrency)
+    // Step 4: bandwidth check then aria2c downloads (bounded concurrency)
+    let (mut traffic_left, traffic_max) = nfd.get_key_info().await?;
+    info!("Bandwidth: {} / {} remaining today", fmt_bytes(traffic_left), fmt_bytes(traffic_max));
+
+    let mut ready: Vec<&DownloadItem> = Vec::new();
+    for item in resolved {
+        if item.size_bytes > 0 && item.size_bytes > traffic_left {
+            warn!("Skipping (insufficient bandwidth): {} — needs {}, only {} left",
+                item.filename, fmt_bytes(item.size_bytes), fmt_bytes(traffic_left));
+        } else {
+            traffic_left = traffic_left.saturating_sub(item.size_bytes);
+            ready.push(item);
+        }
+    }
     let results = stream::iter(ready.iter().map(|item| async move {
         info!("Starting: {}", item.filename);
         match aria2c_download(item).await {

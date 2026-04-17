@@ -14,6 +14,7 @@
 - **Error-page detection** — Nitroflare occasionally returns a small error body (e.g. `ERROR: Wrong IP`) instead of the actual file; ndnblk detects files < 1 KB after a "successful" download, deletes the stub, and retries
 - **Retry logic** — up to 3 attempts per file with a 3 s delay between retries
 - **Tor support** — `--tor` routes all traffic (scraping, API calls, downloads) through a local Tor SOCKS5h proxy on `localhost:9050`
+- **Content filtering** — `--contains` filters, case insensitive, the download links to just those files you are interested in.
 - **Structured logging** — dual output to console and a timestamped log file in `./logs/`
 - **Random user-agent rotation** — via `rand_agents`
 
@@ -43,6 +44,7 @@ Arguments:
 Options:
   -d, --dir <DIR>   Output directory [default: ~/Downloads]
       --tor         Route all traffic through Tor (localhost:9050)
+      --contains    Filter for downloads of interest.  Case insensitive
   -v, --verbose     Increase log verbosity (-v = debug, -vv = trace)
   -h, --help        Print help
   -V, --version     Print version
@@ -59,6 +61,9 @@ Options:
 
 # Re-run to pick up any failures (already-completed files are skipped)
 ./ndnblk https://nitroflare.com/folder/10973/L02xNQV9USFBPLkQ=
+
+# Download a folder with specified filter
+./ndnblk https://nitroflare.com/folder/10973/L02xNQV9USFBPLkQ= --contains "mixes_stereo"
 ```
 
 ## Build

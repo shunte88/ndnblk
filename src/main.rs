@@ -53,6 +53,10 @@ struct Args {
     #[arg(short, long, default_value = DEFAULT_DIR)]
     dir: String,
 
+    /// Only process files whose name contains this string
+    #[arg(long, value_name = "SUBSTRING")]
+    contains: Option<String>,
+
     /// Verbosity (-v = debug, -vv = trace)
     #[arg(short, long, action = ArgAction::Count)]
     verbose: u8,
@@ -117,11 +121,16 @@ impl NFDown {
         let url = format!("{NTFURL_API}/getKeyInfo");
         let params = [("user", self.ux.as_str()), ("premiumKey", self.px.as_str())];
         let j: Value = self.client.get(&url).query(&params).send().await?.json().await?;
+        debug!("getKeyInfo response: {j}");
         let result = j.get("result");
-        let left = result.and_then(|r| r.get("trafficLeft"))
-            .and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0u64);
-        let max  = result.and_then(|r| r.get("trafficMax"))
-            .and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or(0u64);
+        let parse_traffic = |v: &Value| -> u64 {
+            v.as_u64()
+                .or_else(|| v.as_f64().map(|f| f as u64))
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                .unwrap_or(0u64)
+        };
+        let left = result.and_then(|r| r.get("trafficLeft")).map(parse_traffic).unwrap_or(0u64);
+        let max  = result.and_then(|r| r.get("trafficMax")).map(parse_traffic).unwrap_or(0u64);
         Ok((left, max))
     }
 
@@ -381,13 +390,28 @@ async fn main() -> BoxResult<()> {
 
     let nfd = NFDown::init(&ux, &px, &tunnel)?;
 
-    // Step 1: collect (file_id, filename) pairs via ajax/folder.php
+    // Step 1: collect (file_id, filename, size_bytes) triples via ajax/folder.php
     info!("Collecting links from {}", args.folder_url);
-    let pairs = collect_folder_links(&scrape_client, &args.folder_url).await?;
+    let mut pairs = collect_folder_links(&scrape_client, &args.folder_url).await?;
     if pairs.is_empty() {
         warn!("No files found — check the folder URL");
         return Ok(());
     }
+
+    if let Some(ref filter) = args.contains {
+        let before = pairs.len();
+        let filter_lc = filter.to_lowercase();
+        pairs.retain(|(_, name, _)| name.to_lowercase().contains(&filter_lc));
+        let skipped = before - pairs.len();
+        if skipped > 0 {
+            info!("Filter \"{}\" skipped {skipped}/{before} file(s)", filter);
+        }
+        if pairs.is_empty() {
+            warn!("No files match filter \"{}\"", filter);
+            return Ok(());
+        }
+    }
+
     info!("Found {} file(s)", pairs.len());
 
     // Step 2: build download items

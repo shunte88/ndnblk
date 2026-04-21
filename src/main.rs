@@ -273,7 +273,7 @@ async fn aria2c_download(item: &DownloadItem, nfd: &NFDown) -> BoxResult<bool> {
     let dest = std::path::Path::new(&item.dir).join(&item.filename);
     let a = vec![
         "--dir".to_string(),            item.dir.clone(),
-        "--out".to_string(),            item.filename.clone().replace(" ","_"),
+        "--out".to_string(),            item.filename.clone().replace(" ","_").replace("(","_").replace("+","_").replace(")","_").replace("-","_"),
         "--max-connection-per-server=16".to_string(),
         "--max-concurrent-downloads=16".to_string(),
         "--split=20".to_string(),

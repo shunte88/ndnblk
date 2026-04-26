@@ -23,6 +23,7 @@ use std::{
     env,
     error::Error,
     fs,
+    sync::{Arc, atomic::{AtomicU64, Ordering}},
     time::Duration,
 };
 use futures::{stream, StreamExt};
@@ -57,6 +58,10 @@ struct Args {
     #[arg(long, value_name = "SUBSTRING")]
     contains: Option<String>,
 
+    /// Move completed downloads to this final directory (for cross-drive transfers)
+    #[arg(long = "final", value_name = "DIR")]
+    final_dir: Option<String>,
+
     /// Verbosity (-v = debug, -vv = trace)
     #[arg(short, long, action = ArgAction::Count)]
     verbose: u8,
@@ -70,7 +75,18 @@ struct DownloadItem {
     filename: String,
     nf_down: String, // resolved download URL
     dir: String,
+    final_dir: Option<String>,
     size_bytes: u64,
+}
+
+struct InFlightGuard {
+    counter: Arc<AtomicU64>,
+    bytes: u64,
+}
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -174,7 +190,19 @@ impl NFDown {
 }
 
 // helpers
-
+fn fix_filename(f: &str) -> String {
+    // aria2c sanitize filename
+    let ret = f.replace(':', "_")
+        .replace(" ","_")
+        .replace("(","_")
+        .replace("+","_")
+        .replace(")","_")
+        .replace("-","_")
+        .replace(",","_")
+        .replace("_","");
+    return ret;
+}
+ 
 fn parse_size_bytes(s: &str) -> u64 {
     let s = s.trim();
     let (num, unit) = s.split_once(' ').unwrap_or((s, "B"));
@@ -268,27 +296,40 @@ async fn collect_folder_links(client: &Client, folder_url: &str) -> BoxResult<Ve
 
 // aria2c
 
-async fn aria2c_download(item: &DownloadItem, nfd: &NFDown) -> BoxResult<bool> {
+async fn aria2c_download(item: &DownloadItem, nfd: &NFDown, in_flight: Arc<AtomicU64>) -> BoxResult<bool> {
     fs::create_dir_all(&item.dir)?;
-    let dest = std::path::Path::new(&item.dir).join(&item.filename);
-    let a = vec![
-        "--dir".to_string(),            item.dir.clone(),
-        "--out".to_string(),            item.filename.clone().replace(" ","_").replace("(","_").replace("+","_").replace(")","_").replace("-","_"),
-        "--max-connection-per-server=16".to_string(),
-        "--max-concurrent-downloads=16".to_string(),
-        "--split=20".to_string(),
-        "--continue=true".to_string(),
-        "--auto-file-renaming=true".to_string(),
-        "--allow-overwrite=true".to_string(),
-        "--summary-interval=0".to_string(),
-        "--quiet".to_string(),
-        item.nf_down.clone(),
-    ];
-    // Skip if already downloaded successfully
-    if fs::metadata(&dest).map(|m| m.len() > 1024).unwrap_or(false) {
+    let fixed   = fix_filename(&item.filename);
+    let old_dest = std::path::Path::new(&item.dir).join(&item.filename);
+    let dest     = std::path::Path::new(&item.dir).join(&fixed);
+
+    // Skip if already downloaded — check working dir and final dir
+    let exists_working = fs::metadata(&old_dest).map(|m| m.len() > 1024).unwrap_or(false)
+        || fs::metadata(&dest).map(|m| m.len() > 1024).unwrap_or(false);
+    let exists_final = item.final_dir.as_ref().map(|fd| {
+        let p1 = std::path::Path::new(fd).join(&item.filename);
+        let p2 = std::path::Path::new(fd).join(&fixed);
+        fs::metadata(&p1).map(|m| m.len() > 1024).unwrap_or(false)
+            || fs::metadata(&p2).map(|m| m.len() > 1024).unwrap_or(false)
+    }).unwrap_or(false);
+    if exists_working || exists_final {
         info!("Skipping (exists): {}", item.filename);
         return Ok(true);
     }
+
+    // Free space check — only when files stay in the working dir (no --final)
+    let _in_flight_guard = if item.final_dir.is_none() && item.size_bytes > 0 {
+        let avail    = fs2::available_space(&item.dir).unwrap_or(0);
+        let reserved = in_flight.load(Ordering::Relaxed);
+        if avail.saturating_sub(reserved) < item.size_bytes {
+            warn!("Skipping (insufficient space): {} — need {}, {} available ({} in-flight)",
+                item.filename, fmt_bytes(item.size_bytes), fmt_bytes(avail), fmt_bytes(reserved));
+            return Ok(false);
+        }
+        in_flight.fetch_add(item.size_bytes, Ordering::Relaxed);
+        Some(InFlightGuard { counter: in_flight.clone(), bytes: item.size_bytes })
+    } else {
+        None
+    };
 
     // Live bandwidth check — skip if less than 10% of daily allowance remains
     match nfd.get_key_info().await {
@@ -300,11 +341,24 @@ async fn aria2c_download(item: &DownloadItem, nfd: &NFDown) -> BoxResult<bool> {
         _ => {}
     }
 
+    let a = vec![
+        "--dir".to_string(),            item.dir.clone(),
+        "--out".to_string(),            fixed.clone(),
+        "--max-connection-per-server=16".to_string(),
+        "--max-concurrent-downloads=16".to_string(),
+        "--split=20".to_string(),
+        "--continue=true".to_string(),
+        "--auto-file-renaming=true".to_string(),
+        "--allow-overwrite=true".to_string(),
+        "--summary-interval=0".to_string(),
+        "--quiet".to_string(),
+        item.nf_down.clone(),
+    ];
     debug!("aria2c {}", a.join(" "));
 
     for attempt in 1..=3u32 {
         if attempt > 1 {
-            let _ = fs::remove_file(&dest); // remove error-page stub before retry
+            let _ = fs::remove_file(&dest);
             sleep(Duration::from_secs(3)).await;
             info!("Retrying ({attempt}/3): {}", item.filename);
         }
@@ -316,13 +370,24 @@ async fn aria2c_download(item: &DownloadItem, nfd: &NFDown) -> BoxResult<bool> {
             continue;
         }
 
-        // aria2c exited 0 — check the file isn't a tiny error-page response
         match fs::metadata(&dest) {
             Ok(m) if m.len() < 1024 => {
                 warn!("Attempt {attempt}: {} is {} bytes — looks like an error response, retrying",
                     item.filename, m.len());
             }
-            Ok(_) => return Ok(true),
+            Ok(_) => {
+                if let Some(ref fd) = item.final_dir {
+                    fs::create_dir_all(fd)?;
+                    let dst = std::path::Path::new(fd).join(&fixed);
+                    if let Err(_) = fs::rename(&dest, &dst) {
+                        // Cross-filesystem: copy then remove source
+                        fs::copy(&dest, &dst)?;
+                        fs::remove_file(&dest)?;
+                    }
+                    debug!("Moved: {} -> {fd}", item.filename);
+                }
+                return Ok(true);
+            }
             Err(e) => warn!("Attempt {attempt}: cannot stat {}: {e}", item.filename),
         }
     }
@@ -415,6 +480,10 @@ async fn main() -> BoxResult<()> {
     info!("Found {} file(s)", pairs.len());
 
     // Step 2: build download items
+    if let Some(ref fd) = args.final_dir {
+        fs::create_dir_all(fd)?;
+    }
+    let in_flight: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let mut items: Vec<DownloadItem> = pairs
         .into_iter()
         .map(|(file_id, filename, size_bytes)| DownloadItem {
@@ -422,6 +491,7 @@ async fn main() -> BoxResult<()> {
             filename,
             nf_down: String::new(),
             dir: args.dir.clone(),
+            final_dir: args.final_dir.clone(),
             size_bytes,
         })
         .collect();
@@ -466,9 +536,10 @@ async fn main() -> BoxResult<()> {
     }
     let results = stream::iter(ready.iter().map(|item| {
         let nfd = nfd.clone();
+        let in_flight = in_flight.clone();
         async move {
             info!("Starting: {}", item.filename);
-            match aria2c_download(item, &nfd).await {
+            match aria2c_download(item, &nfd, in_flight).await {
                 Ok(true)  => { info!("Done: {}",   item.filename); true  }
                 Ok(false) => { error!("Failed: {}", item.filename); false }
                 Err(e)    => { error!("Error {}: {e}", item.filename); false }
